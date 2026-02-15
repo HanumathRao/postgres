@@ -323,8 +323,12 @@ add_paths_to_joinrel(PlannerInfo *root,
 	 * 4. Consider paths where both outer and inner relations must be hashed
 	 * before being joined.  As above, disregard enable_hashjoin for full
 	 * joins, because there may be no other alternative.
+	 *
+	 * When left-deep-only planning is enabled, don't generate hash joins that
+	 * build the hash table from an intermediate joinrel on the inner side.
 	 */
-	if (enable_hashjoin || jointype == JOIN_FULL)
+	if ((enable_hashjoin || jointype == JOIN_FULL) &&
+		(!enable_left_deep_join || bms_num_members(innerrel->relids) == 1))
 		hash_inner_and_outer(root, joinrel, outerrel, innerrel,
 							 jointype, &extra);
 

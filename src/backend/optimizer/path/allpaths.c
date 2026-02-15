@@ -80,6 +80,8 @@ typedef enum pushdown_safe_type
 /* These parameters are set by GUC */
 bool		enable_geqo = false;	/* just in case GUC doesn't set it */
 bool		enable_eager_aggregate = true;
+bool		enable_left_deep_join = false;
+bool		debug_left_deep_stats = false;
 int			geqo_threshold;
 double		min_eager_agg_group_size;
 int			min_parallel_table_scan_size;

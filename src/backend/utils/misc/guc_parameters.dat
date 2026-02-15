@@ -210,6 +210,21 @@
   boot_val => 'true',
 },
 
+{ name => 'enable_left_deep_join', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
+  short_desc => 'Restricts join search to left-deep trees.',
+  flags => 'GUC_EXPLAIN',
+  variable => 'enable_left_deep_join',
+  boot_val => 'false',
+},
+
+{ name => 'debug_left_deep_stats', type => 'bool', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Logs left-deep join search statistics.',
+  long_desc => 'Emit per-level join-search statistics to validate left-deep join completeness and bushy-plan suppression.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'debug_left_deep_stats',
+  boot_val => 'false',
+},
+
 { name => 'geqo', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_GEQO',
   short_desc => 'Enables genetic query optimization.',
   long_desc => 'This algorithm attempts to do planning without exhaustive searching.',

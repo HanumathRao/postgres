@@ -14,6 +14,8 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
+#include "catalog/pg_class.h"
 #include "miscadmin.h"
 #include "optimizer/appendinfo.h"
 #include "optimizer/cost.h"
@@ -23,6 +25,7 @@
 #include "optimizer/planner.h"
 #include "partitioning/partbounds.h"
 #include "utils/memutils.h"
+#include "utils/syscache.h"
 
 
 static void make_rels_by_clause_joins(PlannerInfo *root,
@@ -61,6 +64,7 @@ static void get_matching_part_pairs(PlannerInfo *root, RelOptInfo *joinrel,
 									List **parts1, List **parts2);
 static uint64 leftdeep_debug_binomial(int n, int k);
 static bool leftdeep_debug_can_check(PlannerInfo *root);
+static Relids leftdeep_get_missing_stats_rels(PlannerInfo *root);
 
 /*
  * Per-level counters reset in join_search_one_level() and incremented in
@@ -68,6 +72,9 @@ static bool leftdeep_debug_can_check(PlannerInfo *root);
  */
 static int	leftdeep_debug_make_calls_level;
 static int	leftdeep_debug_bushy_make_calls_level;
+static int	leftdeep_debug_bushy_pairs_total_level;
+static int	leftdeep_debug_bushy_pairs_skipped_missing_level;
+static int	leftdeep_debug_bushy_pairs_make_attempts_level;
 
 
 static uint64
@@ -99,6 +106,39 @@ leftdeep_debug_can_check(PlannerInfo *root)
 			!root->hasLateralRTEs);
 }
 
+static Relids
+leftdeep_get_missing_stats_rels(PlannerInfo *root)
+{
+	Relids		missing_stats_rels = NULL;
+	int			relid = -1;
+
+	while ((relid = bms_next_member(root->all_baserels, relid)) >= 0)
+	{
+		RangeTblEntry *rte;
+		HeapTuple	tup;
+		Form_pg_class classform;
+
+		if (relid >= root->simple_rel_array_size)
+			continue;
+
+		rte = root->simple_rte_array[relid];
+		if (rte == NULL || rte->rtekind != RTE_RELATION)
+			continue;
+
+		tup = SearchSysCache1(RELOID, ObjectIdGetDatum(rte->relid));
+		if (!HeapTupleIsValid(tup))
+			continue;
+
+		classform = (Form_pg_class) GETSTRUCT(tup);
+		if (classform->reltuples < 0)
+			missing_stats_rels = bms_add_member(missing_stats_rels, relid);
+
+		ReleaseSysCache(tup);
+	}
+
+	return missing_stats_rels;
+}
+
 
 /*
  * join_search_one_level
@@ -121,17 +161,24 @@ join_search_one_level(PlannerInfo *root, int level)
 	int			n_base_rels;
 	int			actual_level_rels;
 	int			k;
+	int			n_missing_stats_rels;
 	uint64		expected_level_rels;
 	bool		can_check_completeness;
+	Relids		missing_stats_rels;
 
 	Assert(joinrels[level] == NIL);
 
 	/* Set join_cur_level so that new joinrels are added to proper list */
 	root->join_cur_level = level;
+	missing_stats_rels = enable_left_deep_join_on_missing_stats ?
+		leftdeep_get_missing_stats_rels(root) : NULL;
 	if (debug_left_deep_stats)
 	{
 		leftdeep_debug_make_calls_level = 0;
 		leftdeep_debug_bushy_make_calls_level = 0;
+		leftdeep_debug_bushy_pairs_total_level = 0;
+		leftdeep_debug_bushy_pairs_skipped_missing_level = 0;
+		leftdeep_debug_bushy_pairs_make_attempts_level = 0;
 	}
 
 	/*
@@ -235,8 +282,20 @@ join_search_one_level(PlannerInfo *root, int level)
 				{
 					RelOptInfo *new_rel = (RelOptInfo *) lfirst(r2);
 
+					if (debug_left_deep_stats)
+						leftdeep_debug_bushy_pairs_total_level++;
+
 					if (!bms_overlap(old_rel->relids, new_rel->relids))
 					{
+						if (missing_stats_rels != NULL &&
+							(bms_overlap(old_rel->relids, missing_stats_rels) ||
+							 bms_overlap(new_rel->relids, missing_stats_rels)))
+						{
+							if (debug_left_deep_stats)
+								leftdeep_debug_bushy_pairs_skipped_missing_level++;
+							continue;
+						}
+
 						/*
 						 * OK, we can build a rel of the right level from this
 						 * pair of rels.  Do so if there is at least one relevant
@@ -245,6 +304,8 @@ join_search_one_level(PlannerInfo *root, int level)
 						if (have_relevant_joinclause(root, old_rel, new_rel) ||
 							have_join_order_restriction(root, old_rel, new_rel))
 						{
+							if (debug_left_deep_stats)
+								leftdeep_debug_bushy_pairs_make_attempts_level++;
 							(void) make_join_rel(root, old_rel, new_rel);
 						}
 					}
@@ -253,7 +314,7 @@ join_search_one_level(PlannerInfo *root, int level)
 		}
 	}
 
-	/*----------
+		/*----------
 	 * Last-ditch effort: if we failed to find any usable joins so far, force
 	 * a set of cartesian-product joins to be generated.  This handles the
 	 * special case where all the available rels have join clauses but we
@@ -315,6 +376,7 @@ join_search_one_level(PlannerInfo *root, int level)
 	{
 		n_base_rels = list_length(joinrels[1]);
 		actual_level_rels = list_length(joinrels[level]);
+		n_missing_stats_rels = bms_num_members(missing_stats_rels);
 		can_check_completeness = leftdeep_debug_can_check(root);
 		if (can_check_completeness)
 			expected_level_rels = leftdeep_debug_binomial(n_base_rels, level);
@@ -322,14 +384,18 @@ join_search_one_level(PlannerInfo *root, int level)
 			expected_level_rels = 0;
 
 		elog(LOG,
-			 "leftdeep_stats level=%d nrels=%d actual=%d expected=" UINT64_FORMAT " completeness=%s make_calls=%d bushy_make_calls=%d",
+			 "leftdeep_stats level=%d nrels=%d actual=%d expected=" UINT64_FORMAT " completeness=%s make_calls=%d bushy_make_calls=%d missing_rels=%d bushy_pairs_total=%d bushy_pairs_skipped_missing=%d bushy_pairs_make_attempts=%d",
 			 level,
 			 n_base_rels,
 			 actual_level_rels,
 			 expected_level_rels,
 			 can_check_completeness ? "on" : "off",
 			 leftdeep_debug_make_calls_level,
-			 leftdeep_debug_bushy_make_calls_level);
+			 leftdeep_debug_bushy_make_calls_level,
+			 n_missing_stats_rels,
+			 leftdeep_debug_bushy_pairs_total_level,
+			 leftdeep_debug_bushy_pairs_skipped_missing_level,
+			 leftdeep_debug_bushy_pairs_make_attempts_level);
 
 		if (enable_left_deep_join && leftdeep_debug_bushy_make_calls_level > 0)
 			elog(WARNING,
@@ -342,6 +408,8 @@ join_search_one_level(PlannerInfo *root, int level)
 				 "leftdeep_stats completeness mismatch at level %d: actual=%d expected=" UINT64_FORMAT,
 				 level, actual_level_rels, expected_level_rels);
 	}
+
+	bms_free(missing_stats_rels);
 }
 
 /*
@@ -534,7 +602,7 @@ join_is_legal(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2,
 				 bms_equal(sjinfo->syn_righthand, rel2->relids) &&
 				 create_unique_paths(root, rel2, sjinfo) != NULL)
 		{
-			/*----------
+	/*----------
 			 * For a semijoin, we can join the RHS to anything else by
 			 * unique-ifying the RHS (if the RHS can be unique-ified).
 			 * We will only get here if we have the full RHS but less

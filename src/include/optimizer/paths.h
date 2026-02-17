@@ -23,6 +23,7 @@
 extern PGDLLIMPORT bool enable_geqo;
 extern PGDLLIMPORT bool enable_eager_aggregate;
 extern PGDLLIMPORT bool enable_left_deep_join;
+extern PGDLLIMPORT bool enable_left_deep_join_on_missing_stats;
 extern PGDLLIMPORT bool debug_left_deep_stats;
 extern PGDLLIMPORT int geqo_threshold;
 extern PGDLLIMPORT double min_eager_agg_group_size;

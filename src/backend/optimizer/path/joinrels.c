@@ -254,14 +254,12 @@ join_search_one_level(PlannerInfo *root, int level)
 	int			n_missing_stats_rels;
 	uint64		expected_level_rels;
 	bool		can_check_completeness;
-	bool		used_bushy_fallback = false;
 	Relids		missing_stats_rels;
 
 	Assert(joinrels[level] == NIL);
 
 	/* Set join_cur_level so that new joinrels are added to proper list */
 	root->join_cur_level = level;
-	leftdeep_bushy_fallback_active = false;
 	missing_stats_rels = enable_left_deep_join_on_missing_stats ?
 		leftdeep_get_missing_stats_rels(root) : NULL;
 	if (debug_left_deep_stats)
@@ -329,21 +327,9 @@ join_search_one_level(PlannerInfo *root, int level)
 		}
 	}
 
-	if (!enable_left_deep_join)
+	if (!enable_left_deep_join || leftdeep_bushy_fallback_active)
 	{
 		make_rels_by_bushy_joins(root, joinrels, level, missing_stats_rels, false);
-	}
-	else if (enable_left_deep_join_bushy_fallback && joinrels[level] == NIL)
-	{
-		/*
-		 * Left-deep-only pairing produced no rels at this level.  Temporarily
-		 * allow bushy enumeration so planning can fall back instead of failing.
-		 * Relax missing-stats bushy pruning in this fallback pass as well.
-		 */
-		leftdeep_bushy_fallback_active = true;
-		make_rels_by_bushy_joins(root, joinrels, level, missing_stats_rels, true);
-		leftdeep_bushy_fallback_active = false;
-		used_bushy_fallback = true;
 	}
 
 		/*----------
@@ -400,7 +386,10 @@ join_search_one_level(PlannerInfo *root, int level)
 		 */
 		if (joinrels[level] == NIL &&
 			root->join_info_list == NIL &&
-			!root->hasLateralRTEs)
+			!root->hasLateralRTEs &&
+			!(enable_left_deep_join &&
+			  enable_left_deep_join_bushy_fallback &&
+			  !leftdeep_bushy_fallback_active))
 			elog(ERROR, "failed to build any %d-way joins", level);
 	}
 
@@ -431,11 +420,11 @@ join_search_one_level(PlannerInfo *root, int level)
 
 		if (enable_left_deep_join &&
 			leftdeep_debug_bushy_make_calls_level > 0 &&
-			!used_bushy_fallback)
+			!leftdeep_bushy_fallback_active)
 			elog(WARNING,
 				 "leftdeep_stats detected bushy make_join_rel calls while enable_left_deep_join=on (level=%d bushy_make_calls=%d)",
 				 level, leftdeep_debug_bushy_make_calls_level);
-		else if (used_bushy_fallback)
+		else if (leftdeep_bushy_fallback_active)
 			elog(LOG,
 				 "leftdeep_stats bushy fallback used at level %d",
 				 level);

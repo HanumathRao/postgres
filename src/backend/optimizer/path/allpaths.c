@@ -171,6 +171,10 @@ static void recurse_push_qual(Node *setOp, Query *topquery,
 							  RangeTblEntry *rte, Index rti, Node *qual);
 static void remove_unused_subquery_outputs(Query *subquery, RelOptInfo *rel,
 										   Bitmapset *extra_used_attrs);
+static RelOptInfo *standard_join_search_pass(PlannerInfo *root,
+											  int levels_needed,
+											  List *initial_rels,
+											  bool throw_on_failure);
 
 
 /*
@@ -3876,7 +3880,8 @@ make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
 RelOptInfo *
 standard_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 {
-	int			lev;
+	int			savelength;
+	struct HTAB *savehash;
 	RelOptInfo *rel;
 
 	/*
@@ -3884,6 +3889,56 @@ standard_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 	 * problem, so join_rel_level[] can't be in use already.
 	 */
 	Assert(root->join_rel_level == NULL);
+
+	/*
+	 * In left-deep mode with bushy fallback enabled, run two complete passes:
+	 * 1) strict left-deep
+	 * 2) if no final rel, full bushy fallback
+	 *
+	 * The second pass avoids any quality drift from per-level fallback.
+	 */
+	if (!(enable_left_deep_join &&
+		  enable_left_deep_join_bushy_fallback &&
+		  !leftdeep_bushy_fallback_active))
+		return standard_join_search_pass(root, levels_needed, initial_rels,
+										 true);
+
+	savelength = list_length(root->join_rel_list);
+	savehash = root->join_rel_hash;
+
+	leftdeep_bushy_fallback_active = false;
+	rel = standard_join_search_pass(root, levels_needed, initial_rels, false);
+	if (rel != NULL)
+		return rel;
+
+	/* Discard first-pass joinrels and retry with full bushy enumeration. */
+	root->join_rel_list = list_truncate(root->join_rel_list, savelength);
+	root->join_rel_hash = savehash;
+	root->join_cur_level = 0;
+
+	PG_TRY();
+	{
+		leftdeep_bushy_fallback_active = true;
+		rel = standard_join_search_pass(root, levels_needed, initial_rels,
+										true);
+	}
+	PG_FINALLY();
+	{
+		leftdeep_bushy_fallback_active = false;
+	}
+	PG_END_TRY();
+
+	return rel;
+}
+
+static RelOptInfo *
+standard_join_search_pass(PlannerInfo *root,
+						  int levels_needed,
+						  List *initial_rels,
+						  bool throw_on_failure)
+{
+	int			lev;
+	RelOptInfo *rel;
 
 	/*
 	 * We employ a simple "dynamic programming" algorithm: we first find all
@@ -3970,16 +4025,20 @@ standard_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 		}
 	}
 
-	/*
-	 * We should have a single rel at the final level.
-	 */
+	/* We should have a single rel at the final level. */
 	if (root->join_rel_level[levels_needed] == NIL)
-		elog(ERROR, "failed to build any %d-way joins", levels_needed);
+	{
+		root->join_rel_level = NULL;
+		if (throw_on_failure)
+			elog(ERROR, "failed to build any %d-way joins", levels_needed);
+		return NULL;
+	}
 	Assert(list_length(root->join_rel_level[levels_needed]) == 1);
 
 	rel = (RelOptInfo *) linitial(root->join_rel_level[levels_needed]);
 
 	root->join_rel_level = NULL;
+	root->join_cur_level = 0;
 
 	return rel;
 }

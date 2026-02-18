@@ -35,6 +35,11 @@ static void make_rels_by_clause_joins(PlannerInfo *root,
 static void make_rels_by_clauseless_joins(PlannerInfo *root,
 										  RelOptInfo *old_rel,
 										  List *other_rels);
+static void make_rels_by_bushy_joins(PlannerInfo *root,
+									 List **joinrels,
+									 int level,
+									 Relids missing_stats_rels,
+									 bool relax_missing_stats);
 static bool has_join_restriction(PlannerInfo *root, RelOptInfo *rel);
 static bool has_legal_joinclause(PlannerInfo *root, RelOptInfo *rel);
 static bool restriction_is_constant_false(List *restrictlist,
@@ -139,6 +144,92 @@ leftdeep_get_missing_stats_rels(PlannerInfo *root)
 	return missing_stats_rels;
 }
 
+static void
+make_rels_by_bushy_joins(PlannerInfo *root,
+						 List **joinrels,
+						 int level,
+						 Relids missing_stats_rels,
+						 bool relax_missing_stats)
+{
+	int			k;
+	ListCell   *r;
+
+	/*
+	 * Consider "bushy plans" in which relations of k initial rels are joined
+	 * to relations of level-k initial rels, for 2 <= k <= level-2.
+	 *
+	 * We only consider bushy-plan joins for pairs of rels where there is a
+	 * suitable join clause (or join order restriction), in order to avoid
+	 * unreasonable growth of planning time.
+	 */
+	for (k = 2;; k++)
+	{
+		int			other_level = level - k;
+
+		/*
+		 * Since make_join_rel(x, y) handles both x,y and y,x cases, we only
+		 * need to go as far as the halfway point.
+		 */
+		if (k > other_level)
+			break;
+
+		foreach(r, joinrels[k])
+		{
+			RelOptInfo *old_rel = (RelOptInfo *) lfirst(r);
+			int			first_rel;
+			ListCell   *r2;
+
+			/*
+			 * We can ignore relations without join clauses here, unless they
+			 * participate in join-order restrictions --- then we might have
+			 * to force a bushy join plan.
+			 */
+			if (old_rel->joininfo == NIL && !old_rel->has_eclass_joins &&
+				!has_join_restriction(root, old_rel))
+				continue;
+
+			if (k == other_level)	/* only consider remaining rels */
+				first_rel = foreach_current_index(r) + 1;
+			else
+				first_rel = 0;
+
+			for_each_from(r2, joinrels[other_level], first_rel)
+			{
+				RelOptInfo *new_rel = (RelOptInfo *) lfirst(r2);
+
+				if (debug_left_deep_stats)
+					leftdeep_debug_bushy_pairs_total_level++;
+
+				if (!bms_overlap(old_rel->relids, new_rel->relids))
+				{
+					if (!relax_missing_stats &&
+						missing_stats_rels != NULL &&
+						(bms_overlap(old_rel->relids, missing_stats_rels) ||
+						 bms_overlap(new_rel->relids, missing_stats_rels)))
+					{
+						if (debug_left_deep_stats)
+							leftdeep_debug_bushy_pairs_skipped_missing_level++;
+						continue;
+					}
+
+					/*
+					 * OK, we can build a rel of the right level from this pair
+					 * of rels.  Do so if there is at least one relevant join
+					 * clause or join order restriction.
+					 */
+					if (have_relevant_joinclause(root, old_rel, new_rel) ||
+						have_join_order_restriction(root, old_rel, new_rel))
+					{
+						if (debug_left_deep_stats)
+							leftdeep_debug_bushy_pairs_make_attempts_level++;
+						(void) make_join_rel(root, old_rel, new_rel);
+					}
+				}
+			}
+		}
+	}
+}
+
 
 /*
  * join_search_one_level
@@ -160,16 +251,17 @@ join_search_one_level(PlannerInfo *root, int level)
 	ListCell   *r;
 	int			n_base_rels;
 	int			actual_level_rels;
-	int			k;
 	int			n_missing_stats_rels;
 	uint64		expected_level_rels;
 	bool		can_check_completeness;
+	bool		used_bushy_fallback = false;
 	Relids		missing_stats_rels;
 
 	Assert(joinrels[level] == NIL);
 
 	/* Set join_cur_level so that new joinrels are added to proper list */
 	root->join_cur_level = level;
+	leftdeep_bushy_fallback_active = false;
 	missing_stats_rels = enable_left_deep_join_on_missing_stats ?
 		leftdeep_get_missing_stats_rels(root) : NULL;
 	if (debug_left_deep_stats)
@@ -239,79 +331,19 @@ join_search_one_level(PlannerInfo *root, int level)
 
 	if (!enable_left_deep_join)
 	{
+		make_rels_by_bushy_joins(root, joinrels, level, missing_stats_rels, false);
+	}
+	else if (enable_left_deep_join_bushy_fallback && joinrels[level] == NIL)
+	{
 		/*
-		 * Now, consider "bushy plans" in which relations of k initial rels are
-		 * joined to relations of level-k initial rels, for 2 <= k <= level-2.
-		 *
-		 * We only consider bushy-plan joins for pairs of rels where there is a
-		 * suitable join clause (or join order restriction), in order to avoid
-		 * unreasonable growth of planning time.
+		 * Left-deep-only pairing produced no rels at this level.  Temporarily
+		 * allow bushy enumeration so planning can fall back instead of failing.
+		 * Relax missing-stats bushy pruning in this fallback pass as well.
 		 */
-		for (k = 2;; k++)
-		{
-			int			other_level = level - k;
-
-			/*
-			 * Since make_join_rel(x, y) handles both x,y and y,x cases, we only
-			 * need to go as far as the halfway point.
-			 */
-			if (k > other_level)
-				break;
-
-			foreach(r, joinrels[k])
-			{
-				RelOptInfo *old_rel = (RelOptInfo *) lfirst(r);
-				int			first_rel;
-				ListCell   *r2;
-
-				/*
-				 * We can ignore relations without join clauses here, unless they
-				 * participate in join-order restrictions --- then we might have
-				 * to force a bushy join plan.
-				 */
-				if (old_rel->joininfo == NIL && !old_rel->has_eclass_joins &&
-					!has_join_restriction(root, old_rel))
-					continue;
-
-				if (k == other_level)	/* only consider remaining rels */
-					first_rel = foreach_current_index(r) + 1;
-				else
-					first_rel = 0;
-
-				for_each_from(r2, joinrels[other_level], first_rel)
-				{
-					RelOptInfo *new_rel = (RelOptInfo *) lfirst(r2);
-
-					if (debug_left_deep_stats)
-						leftdeep_debug_bushy_pairs_total_level++;
-
-					if (!bms_overlap(old_rel->relids, new_rel->relids))
-					{
-						if (missing_stats_rels != NULL &&
-							(bms_overlap(old_rel->relids, missing_stats_rels) ||
-							 bms_overlap(new_rel->relids, missing_stats_rels)))
-						{
-							if (debug_left_deep_stats)
-								leftdeep_debug_bushy_pairs_skipped_missing_level++;
-							continue;
-						}
-
-						/*
-						 * OK, we can build a rel of the right level from this
-						 * pair of rels.  Do so if there is at least one relevant
-						 * join clause or join order restriction.
-						 */
-						if (have_relevant_joinclause(root, old_rel, new_rel) ||
-							have_join_order_restriction(root, old_rel, new_rel))
-						{
-							if (debug_left_deep_stats)
-								leftdeep_debug_bushy_pairs_make_attempts_level++;
-							(void) make_join_rel(root, old_rel, new_rel);
-						}
-					}
-				}
-			}
-		}
+		leftdeep_bushy_fallback_active = true;
+		make_rels_by_bushy_joins(root, joinrels, level, missing_stats_rels, true);
+		leftdeep_bushy_fallback_active = false;
+		used_bushy_fallback = true;
 	}
 
 		/*----------
@@ -397,10 +429,16 @@ join_search_one_level(PlannerInfo *root, int level)
 			 leftdeep_debug_bushy_pairs_skipped_missing_level,
 			 leftdeep_debug_bushy_pairs_make_attempts_level);
 
-		if (enable_left_deep_join && leftdeep_debug_bushy_make_calls_level > 0)
+		if (enable_left_deep_join &&
+			leftdeep_debug_bushy_make_calls_level > 0 &&
+			!used_bushy_fallback)
 			elog(WARNING,
 				 "leftdeep_stats detected bushy make_join_rel calls while enable_left_deep_join=on (level=%d bushy_make_calls=%d)",
 				 level, leftdeep_debug_bushy_make_calls_level);
+		else if (used_bushy_fallback)
+			elog(LOG,
+				 "leftdeep_stats bushy fallback used at level %d",
+				 level);
 
 		if (can_check_completeness &&
 			expected_level_rels != (uint64) actual_level_rels)
@@ -1236,8 +1274,9 @@ populate_joinrel_with_paths(PlannerInfo *root, RelOptInfo *rel1,
 							SpecialJoinInfo *sjinfo, List *restrictlist)
 {
 	RelOptInfo *unique_rel2;
-	/* In left-deep mode, only keep rel1 as outer and rel2 as inner. */
-	bool		allow_reversed = !enable_left_deep_join;
+	/* In left-deep mode, only keep rel1 as outer and rel2 as inner unless fallback is active. */
+	bool		allow_reversed = (!enable_left_deep_join ||
+							 leftdeep_bushy_fallback_active);
 
 	/*
 	 * Consider paths using each rel as both outer and inner.  Depending on

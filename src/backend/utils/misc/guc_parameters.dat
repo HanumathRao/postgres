@@ -225,6 +225,14 @@
   boot_val => 'false',
 },
 
+{ name => 'enable_left_deep_join_bushy_fallback', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
+  short_desc => 'Allows bushy join fallback when strict left-deep search cannot build a level.',
+  long_desc => 'When enabled with enable_left_deep_join, if a planning level cannot be built using strict left-deep pairing, planner temporarily allows bushy pair generation as a fallback.',
+  flags => 'GUC_EXPLAIN',
+  variable => 'enable_left_deep_join_bushy_fallback',
+  boot_val => 'true',
+},
+
 { name => 'debug_left_deep_stats', type => 'bool', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
   short_desc => 'Logs left-deep join search statistics.',
   long_desc => 'Emit per-level join-search statistics to validate left-deep join completeness and bushy-plan suppression.',

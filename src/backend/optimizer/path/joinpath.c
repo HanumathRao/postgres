@@ -328,7 +328,9 @@ add_paths_to_joinrel(PlannerInfo *root,
 	 * build the hash table from an intermediate joinrel on the inner side.
 	 */
 	if ((enable_hashjoin || jointype == JOIN_FULL) &&
-		(!enable_left_deep_join || bms_num_members(innerrel->relids) == 1))
+		(!enable_left_deep_join ||
+		 leftdeep_bushy_fallback_active ||
+		 bms_num_members(innerrel->relids) == 1))
 		hash_inner_and_outer(root, joinrel, outerrel, innerrel,
 							 jointype, &extra);
 

@@ -82,7 +82,9 @@ bool		enable_geqo = false;	/* just in case GUC doesn't set it */
 bool		enable_eager_aggregate = true;
 bool		enable_left_deep_join = false;
 bool		enable_left_deep_join_on_missing_stats = false;
+bool		enable_left_deep_join_bushy_fallback = true;
 bool		debug_left_deep_stats = false;
+bool		leftdeep_bushy_fallback_active = false;
 int			geqo_threshold;
 double		min_eager_agg_group_size;
 int			min_parallel_table_scan_size;
